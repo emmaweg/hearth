@@ -2,7 +2,89 @@
 
 Small, honest tools for running a fleet of Claude Code agents: several long-lived sessions, one per role, working side by side in tmux on one machine.
 
-hearth starts with one tool and will grow as the fleet does.
+hearth has two tools so far, and will grow as the fleet does:
+
+- **hearth**, a launcher that gives each project its own tmux session and a menu to move between them.
+- **embers**, a Stop hook that keeps an idle session's prompt cache warm.
+
+## hearth: one tmux session per project
+
+```
+   hearth · 2 running
+
+   work
+  ▸ api
+  2 reviewer  ● claude
+  3 docs      ● claude+codex
+   ──────────────────────────────
+  4 + Add a project
+  5 ○ Back to the shell
+
+  agent: claude (a toggles)   ↑↓ or j k move   1-9, 0 jump   enter open   q quit
+```
+
+Pick a project and hearth attaches to its session, starting it first if it isn't running. A new session resumes the agent's last conversation in that directory, or starts a fresh one, and leaves you at a shell when the agent exits. Run inside tmux, hearth switches to the session instead of nesting.
+
+```bash
+hearth                         # the menu
+hearth start api               # start or attach, from a script or another pane
+hearth start api codex         # the same project with Codex, as session "api-codex"
+hearth list                    # every project and what's running
+hearth add api ~/src/api work  # add a project, optionally under a category
+hearth kill api                # end the project's sessions
+```
+
+### Install
+
+```bash
+mkdir -p ~/.local/bin
+cp bin/hearth ~/.local/bin/hearth
+chmod +x ~/.local/bin/hearth
+```
+
+Make sure `~/.local/bin` is on your `PATH`.
+
+### The registry
+
+Projects live in `~/.config/hearth/projects.conf`, one per line, with fields separated by colons:
+
+```
+name:directory:prompt:category:agent:options
+```
+
+Only the name and directory are required, and `hearth add` writes those for you. Edit the file by hand for the rest:
+
+| Field | Meaning |
+| --- | --- |
+| `prompt` | sent to the agent when the session starts |
+| `category` | groups projects in the menu and the list, in the order they first appear |
+| `agent` | `claude` or `codex` pins the entry to one agent; empty follows the menu's toggle |
+| `options` | for Claude, a comma list: `agent=<name>` loads `.claude/agents/<name>.md`, `session=<uuid>` pins the conversation |
+
+Several roles can share one directory. `claude --continue` resumes whichever conversation in a directory ran last, so an entry with `agent=` gets its own conversation instead: hearth derives a stable session id from the entry's name, or uses the `session=` you give it.
+
+```
+# a reviewer and a writer working in the same repo
+reviewer:~/src/api:Review the open branches.:work::agent=reviewer
+writer:~/src/api::work::agent=writer
+```
+
+Lines starting with `#` are comments. Because fields are colon-separated, a directory can't contain `:`.
+
+### Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HEARTH_PROJECTS` | `~/.config/hearth/projects.conf` | the registry file |
+| `HEARTH_AGENT` | `claude` | the agent the menu starts with |
+| `HEARTH_CLAUDE_ARGS` | empty | extra arguments for every Claude session |
+| `HEARTH_CODEX_ARGS` | empty | extra arguments for every Codex session |
+
+For example, `HEARTH_CLAUDE_ARGS="--model opus"`. hearth never adds permission flags on its own, so sessions ask for permission the way Claude Code normally does unless you pass one here.
+
+### Requirements
+
+python3 (3.9 or later, standard library only), tmux, and `claude` or `codex` on your `PATH`.
 
 ## embers: keep an idle session's prompt cache warm
 
@@ -45,10 +127,6 @@ tmux records when a window last changed. A busy session redraws its pane, so emb
 ### Requirements
 
 bash, tmux, python3 (only to read the hook's JSON input), and Claude Code with hooks enabled.
-
-## Coming next
-
-- A small launcher and menu for starting, attaching and naming role sessions in tmux.
 
 ## License
 
