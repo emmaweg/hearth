@@ -291,10 +291,11 @@ def cmd_menu(args):
 ADD, SHELL = "+ Add a project", "○ Back to the shell"
 
 LETTERS = [
-    "   __                __  __ ",
-    "  / /  ___ ___ _____/ /_/ / ",
-    " / _ \\/ -_) _ `/ __/ __/ _ \\",
-    "/_//_/\\__/\\_,_/_/  \\__/_//_/",
+    "█                             ▄    █    ",
+    "█ ▄▄    ▄▄▄    ▄▄▄    ▄ ▄▄  ▄▄█▄▄  █ ▄▄ ",
+    "█▀  █  █▀  █  ▀   █   █▀  ▀   █    █▀  █",
+    "█   █  █▀▀▀▀  ▄▀▀▀█   █       █    █   █",
+    "█   █  ▀█▄▄▀  ▀▄▄▀█   █       ▀▄▄  █   █",
 ]
 BANNER = (["╭" + "─" * (len(LETTERS[0]) + 2) + "╮"]
           + ["│ " + line + " │" for line in LETTERS]
@@ -338,12 +339,11 @@ def menu():
             7: ((117, -1), (curses.COLOR_CYAN, -1)),                # footer
             8: ((215, -1), (curses.COLOR_YELLOW, -1)),              # category
             9: ((137, -1), (curses.COLOR_YELLOW, -1)),              # banner frame
-            # banner letters, amber at the top cooling to coral like embers
-            10: ((221, -1), (curses.COLOR_YELLOW, -1)),
-            11: ((215, -1), (curses.COLOR_YELLOW, -1)),
-            12: ((209, -1), (curses.COLOR_RED, -1)),
-            13: ((203, -1), (curses.COLOR_RED, -1)),
         }
+        # Banner letters, one colour per row: amber at the top, cooling to coral like embers.
+        y, r = curses.COLOR_YELLOW, curses.COLOR_RED
+        for n, (full, basic) in enumerate([(222, y), (221, y), (215, y), (209, r), (203, r)], start=10):
+            pairs[n] = ((full, -1), (basic, -1))
         for n, (full, basic) in pairs.items():
             curses.init_pair(n, *(full if rich else basic))
 
