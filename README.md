@@ -9,19 +9,7 @@ hearth has two tools so far, and will grow as the fleet does:
 
 ## hearth: one tmux session per project
 
-```
-   hearth · 2 running
-
-   work
-  ▸ api
-  2 reviewer  ● claude
-  3 docs      ● claude+codex
-   ──────────────────────────────
-  4 + Add a project
-  5 ○ Back to the shell
-
-  agent: claude (a toggles)   ↑↓ or j k move   1-9, 0 jump   enter open   q quit
-```
+<img src="docs/menu.png" alt="The hearth menu: projects grouped by category, with the running ones marked by agent" width="760">
 
 Pick a project and hearth attaches to its session, starting it first if it isn't running. A new session resumes the agent's last conversation in that directory, or starts a fresh one, and leaves you at a shell when the agent exits. Run inside tmux, hearth switches to the session instead of nesting.
 

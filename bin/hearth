@@ -307,6 +307,7 @@ def menu():
         rows.extend(("project", p) for p in members)
     rows += [("rule",), ("action", ADD), ("action", SHELL)]
     selectable = [i for i, r in enumerate(rows) if r[0] in ("project", "action")]
+    name_width = max([len(p.name) for p in projects] or [0])  # lines up the ● column
 
     def pick(row, agent):
         if row[0] == "project":
@@ -370,7 +371,7 @@ def menu():
                 curses.color_pair(3 if selected else 2) | (curses.A_BOLD if selected else 0))
             up = status(row[1], running) if row[0] == "project" else ""
             if up:
-                put(scr, y, len(prefix) + len(label) + 1, " ● " + up,
+                put(scr, y, len(prefix) + name_width + 1, " ● " + up,
                     curses.color_pair(5 if selected else 4) | (curses.A_BOLD if selected else 0))
         put(scr, h - 2, 2, "agent: %s (a toggles)   ↑↓ or j k move   1-9, 0 jump   enter open   q quit"
             % agent, curses.color_pair(7))
