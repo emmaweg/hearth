@@ -1,0 +1,512 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  hearth agent server: one EC2 instance with tmux, Claude Code, hearth and
+  embers installed, ready to run a fleet of agents. MIT License.
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type. Match it to Architecture (t4g, m7g and other "g" types are arm64).
+    Type: String
+    Default: t4g.small
+
+  Architecture:
+    Description: CPU architecture of the instance type
+    Type: String
+    Default: arm64
+    AllowedValues: [arm64, x86_64]
+
+  ImageId:
+    Description: >-
+      AMI to run. Leave empty on the first deploy to get the latest Amazon Linux 2023, then set it
+      to the image the FindImageId output prints, so later stack updates don't replace the server with a newer image.
+    Type: String
+    Default: ''
+
+  VolumeSizeGB:
+    Description: Size of the root volume in GB
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 1000
+
+  AgentUser:
+    Description: Linux user the agents run as
+    Type: String
+    Default: agent
+    AllowedPattern: '^[a-z_][a-z0-9_-]{0,30}$'
+
+  KeyName:
+    Description: Existing EC2 key pair for SSH. Leave empty to connect with SSM Session Manager only.
+    Type: String
+    Default: ''
+
+  SSHCidr:
+    Description: Address range allowed to SSH in, such as 203.0.113.7/32. Leave empty to open no SSH port.
+    Type: String
+    Default: ''
+
+  HostedZoneId:
+    Description: Route 53 hosted zone for a DNS record (optional)
+    Type: String
+    Default: ''
+
+  RecordName:
+    Description: Full DNS name for the server, such as agents.example.com (used only with HostedZoneId)
+    Type: String
+    Default: ''
+
+  GitName:
+    Description: git user.name for the agent user (optional)
+    Type: String
+    Default: ''
+
+  GitEmail:
+    Description: git user.email for the agent user (optional)
+    Type: String
+    Default: ''
+
+  GitHubSSHKeySecretArn:
+    Description: >-
+      Secrets Manager secret holding a private SSH key for GitHub (optional).
+      Without it, the server generates a key and prints the public half in the setup log.
+    Type: String
+    Default: ''
+
+  HearthRepo:
+    Description: Git URL to install hearth and embers from
+    Type: String
+    Default: https://github.com/emmaweg/hearth.git
+
+  HearthRef:
+    Description: Branch or tag of hearth to install
+    Type: String
+    Default: main
+
+  AutoUpdate:
+    Description: Apply OS updates weekly, moving to the newest Amazon Linux 2023 release. It never reboots.
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  InstallCodex:
+    Description: Also install the OpenAI Codex CLI, for hearth's Codex sessions
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  EnableMonitoring:
+    Description: Install the CloudWatch agent and create a dashboard for CPU, memory, disk and network
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableSnapshots:
+    Description: Take a daily snapshot of the root volume and keep the last 7
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  IsArm64: !Equals [!Ref Architecture, arm64]
+  HasImageId: !Not [!Equals [!Ref ImageId, '']]
+  HasKey: !Not [!Equals [!Ref KeyName, '']]
+  HasSSH: !Not [!Equals [!Ref SSHCidr, '']]
+  HasDNS: !And
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+    - !Not [!Equals [!Ref RecordName, '']]
+  HasGitHubKey: !Not [!Equals [!Ref GitHubSSHKeySecretArn, '']]
+  Monitoring: !Equals [!Ref EnableMonitoring, 'true']
+  Snapshots: !Equals [!Ref EnableSnapshots, 'true']
+
+Resources:
+  # ── Network: a VPC with one public subnet ─────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-routes
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # Outbound only, plus SSH from SSHCidr when it's set.
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub hearth agent server ${AWS::StackName}
+      VpcId: !Ref VPC
+      SecurityGroupIngress: !If
+        - HasSSH
+        - - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref SSHCidr
+            Description: SSH
+        - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-sg
+
+  # ── Permissions: Session Manager and metrics, nothing more ────────
+  # Agents that need AWS access should get it from a role you scope
+  # yourself, attached to InstanceRole after the stack is up.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !If
+          - Monitoring
+          - !Sub arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy
+          - !Ref AWS::NoValue
+      Policies:
+        - !If
+          - HasGitHubKey
+          - PolicyName: read-github-key
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref GitHubSSHKeySecretArn
+          - !Ref AWS::NoValue
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ── The server ────────────────────────────────────────────────────
+  Instance:
+    Type: AWS::EC2::Instance
+    # If an update ever does replace the server, keep the old one (and its
+    # disk) instead of deleting it. Delete it yourself once you've moved off.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete  # deleting the stack still deletes the server
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT30M
+    Properties:
+      InstanceType: !Ref InstanceType
+      # The latest-image lookup runs again on every stack update, so pin ImageId after the first deploy.
+      ImageId: !If
+        - HasImageId
+        - !Ref ImageId
+        - !If
+          - IsArm64
+          - '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+          - '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      KeyName: !If [HasKey, !Ref KeyName, !Ref AWS::NoValue]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSizeGB
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-server
+        - Key: hearth:snapshots
+          Value: !Ref AWS::StackName
+      # User data runs once, on first boot. To change setup on a running
+      # server, change it by hand or replace the instance.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee -a /var/log/hearth-setup.log) 2>&1
+
+          # Tell CloudFormation how setup ended, so a failure fails the
+          # stack right away instead of after the 30-minute timeout.
+          signal() {
+            /opt/aws/bin/cfn-signal --exit-code "$1" --region ${AWS::Region} \
+              --stack ${AWS::StackName} --resource Instance || true
+          }
+          trap 'signal 1' ERR
+
+          dnf update -y
+          dnf install -y git tmux jq python3 aws-cfn-bootstrap
+
+          # The agent user, with passwordless sudo, signing in with the
+          # instance's key pair when there is one.
+          id ${AgentUser} >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash ${AgentUser}
+          echo "${AgentUser} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${AgentUser}
+          chmod 440 /etc/sudoers.d/${AgentUser}
+          home=/home/${AgentUser}
+          install -d -m 700 -o ${AgentUser} -g ${AgentUser} $home/.ssh
+          if [ -s /home/ec2-user/.ssh/authorized_keys ]; then
+            install -m 600 -o ${AgentUser} -g ${AgentUser} \
+              /home/ec2-user/.ssh/authorized_keys $home/.ssh/authorized_keys
+          fi
+
+          # A GitHub key from Secrets Manager, or a new one to add to GitHub.
+          if [ -n "${GitHubSSHKeySecretArn}" ]; then
+            aws secretsmanager get-secret-value --region ${AWS::Region} \
+              --secret-id "${GitHubSSHKeySecretArn}" --query SecretString --output text \
+              > $home/.ssh/id_ed25519
+          else
+            ssh-keygen -q -t ed25519 -N '' -C "${AgentUser}@${AWS::StackName}" -f $home/.ssh/id_ed25519
+            echo "Add this key to GitHub to let the agents clone and push:"
+            cat $home/.ssh/id_ed25519.pub
+          fi
+          chmod 600 $home/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> $home/.ssh/known_hosts 2>/dev/null
+          chown -R ${AgentUser}:${AgentUser} $home/.ssh
+
+          # Claude Code, hearth and embers, installed as the agent user.
+          cat > /tmp/hearth-user-setup.sh <<'USER_SETUP'
+          set -euo pipefail
+          cd "$HOME"
+          mkdir -p .local/bin .claude/hooks
+          curl -fsSL https://claude.ai/install.sh | bash
+
+          if [ "$INSTALL_CODEX" = true ]; then
+            arch=$(uname -m)  # aarch64 or x86_64, as Codex names its builds
+            curl -fsSL "https://github.com/openai/codex/releases/latest/download/codex-$arch-unknown-linux-musl.tar.gz" \
+              | tar -xz -C .local/bin
+            mv ".local/bin/codex-$arch-unknown-linux-musl" .local/bin/codex
+          fi
+
+          git clone --branch "$HEARTH_REF" "$HEARTH_REPO" hearth
+          # Links, not copies, so `git -C ~/hearth pull` is the whole upgrade.
+          [ -f hearth/bin/hearth ] && ln -sf "$HOME/hearth/bin/hearth" .local/bin/hearth
+          ln -sf "$HOME/hearth/hooks/embers.sh" .claude/hooks/embers.sh
+          # The embers Stop hook, merged into any user settings already there.
+          [ -f .claude/settings.json ] || echo '{}' > .claude/settings.json
+          jq '.hooks.Stop = ((.hooks.Stop // []) + [{"hooks":[{"type":"command","command":"$HOME/.claude/hooks/embers.sh"}]}])' \
+            .claude/settings.json > .claude/settings.json.new
+          mv .claude/settings.json.new .claude/settings.json
+
+          [ -n "$GIT_NAME" ] && git config --global user.name "$GIT_NAME"
+          [ -n "$GIT_EMAIL" ] && git config --global user.email "$GIT_EMAIL"
+          grep -q 'local/bin' .bashrc || echo 'export PATH="$HOME/.local/bin:$PATH"' >> .bashrc
+          true
+          USER_SETUP
+          sudo -iu ${AgentUser} env HEARTH_REPO='${HearthRepo}' HEARTH_REF='${HearthRef}' \
+            GIT_NAME='${GitName}' GIT_EMAIL='${GitEmail}' INSTALL_CODEX='${InstallCodex}' bash /tmp/hearth-user-setup.sh
+          rm -f /tmp/hearth-user-setup.sh
+
+          cat > /etc/motd.d/hearth <<'MOTD'
+
+            hearth agent server
+            Sign in to Claude Code once with: claude
+            Then add projects with: hearth add <name> <dir>   and open the menu with: hearth
+
+          MOTD
+
+          # Weekly OS updates. Amazon Linux 2023 stays on the release it booted
+          # with unless asked, so this moves it to the latest one. No reboot: that
+          # would end the agents' sessions. Reboot yourself after kernel updates.
+          if [ "${AutoUpdate}" = true ]; then
+            cat > /etc/systemd/system/hearth-update.service <<'UNIT'
+          [Unit]
+          Description=Apply Amazon Linux updates (hearth)
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/dnf upgrade -y --releasever=latest
+          UNIT
+            cat > /etc/systemd/system/hearth-update.timer <<'UNIT'
+          [Unit]
+          Description=Weekly Amazon Linux updates (hearth)
+          [Timer]
+          OnCalendar=Sun 04:00
+          RandomizedDelaySec=1h
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          UNIT
+            systemctl daemon-reload
+            systemctl enable --now hearth-update.timer
+          fi
+
+          if [ "${EnableMonitoring}" = true ]; then
+            dnf install -y amazon-cloudwatch-agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENT'
+          {
+            "metrics": {
+              "append_dimensions": { "InstanceId": "${!aws:InstanceId}" },
+              "metrics_collected": {
+                "mem": { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 },
+                "disk": { "measurement": ["disk_used_percent"], "metrics_collection_interval": 60, "resources": ["/"] }
+              }
+            }
+          }
+          CWAGENT
+            systemctl enable --now amazon-cloudwatch-agent
+          fi
+
+          trap - ERR
+          signal 0
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDNS
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref RecordName
+      Type: A
+      TTL: 300
+      ResourceRecords:
+        - !GetAtt Instance.PublicIp
+
+  # ── Optional extras ───────────────────────────────────────────────
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: Monitoring
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-server
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+                "title": "CPU", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 300,
+                "metrics": [["AWS/EC2", "CPUUtilization", "InstanceId", "${Instance}"]] } },
+            { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+                "title": "Network", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 300,
+                "metrics": [["AWS/EC2", "NetworkIn", "InstanceId", "${Instance}"],
+                            ["AWS/EC2", "NetworkOut", "InstanceId", "${Instance}"]] } },
+            { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+                "title": "Memory used %", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 300,
+                "metrics": [["CWAgent", "mem_used_percent", "InstanceId", "${Instance}"]] } },
+            { "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+                "title": "Disk used %", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 300,
+                "metrics": [["CWAgent", "disk_used_percent", "path", "/", "InstanceId", "${Instance}"]] } }
+          ]
+        }
+
+  SnapshotRole:
+    Type: AWS::IAM::Role
+    Condition: Snapshots
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dlm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+  SnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Condition: Snapshots
+    Properties:
+      Description: !Sub Daily snapshots of ${AWS::StackName}
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt SnapshotRole.Arn
+      PolicyDetails:
+        ResourceTypes: [INSTANCE]
+        TargetTags:
+          - Key: hearth:snapshots
+            Value: !Ref AWS::StackName
+        Schedules:
+          - Name: daily
+            CopyTags: true
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times: ['03:00']
+            RetainRule:
+              Count: 7
+
+Outputs:
+  PublicIp:
+    Description: Public IP of the server. It changes if the instance is stopped and started.
+    Value: !GetAtt Instance.PublicIp
+
+  DNSName:
+    Condition: HasDNS
+    Description: DNS name of the server
+    Value: !Ref RecordName
+
+  SSHCommand:
+    Condition: HasSSH
+    Description: Connect with SSH
+    Value: !Sub
+      - ssh ${AgentUser}@${Host}
+      - Host: !If [HasDNS, !Ref RecordName, !GetAtt Instance.PublicIp]
+
+  FindImageId:
+    Description: Prints the AMI the server runs. Pass it as the ImageId parameter on later updates.
+    Value: !Sub aws ec2 describe-instances --region ${AWS::Region} --instance-ids ${Instance} --query 'Reservations[0].Instances[0].ImageId' --output text
+
+  SessionManagerCommand:
+    Description: Connect without SSH, then run sudo -iu as the agent user
+    Value: !Sub aws ssm start-session --region ${AWS::Region} --target ${Instance}
+
+  SetupLog:
+    Description: Where first-boot setup logs, including a generated GitHub public key
+    Value: /var/log/hearth-setup.log
+
+  Dashboard:
+    Condition: Monitoring
+    Description: CloudWatch dashboard
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-server

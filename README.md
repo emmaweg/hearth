@@ -7,6 +7,8 @@ hearth has two tools so far, and will grow as the fleet does:
 - **hearth**, a launcher that gives each project its own tmux session and a menu to move between them.
 - **embers**, a Stop hook that keeps an idle session's prompt cache warm.
 
+There's also a CloudFormation template for a cloud server that runs them, if you'd rather not keep a machine on at home.
+
 ## hearth: one tmux session per project
 
 <img src="docs/menu.png" alt="The hearth menu: projects grouped by category, with the running ones marked by agent" width="760">
@@ -115,6 +117,59 @@ tmux records when a window last changed. A busy session redraws its pane, so emb
 ### Requirements
 
 bash, tmux, python3 (only to read the hook's JSON input), and Claude Code with hooks enabled.
+
+## A server in the cloud
+
+`cloud/agent-server.yaml` is a CloudFormation template for an always-on machine to run the fleet on, as an alternative to keeping a spare computer at home. It isn't minimal, but it's everything an agent server needs:
+
+- one EC2 instance (Amazon Linux 2023, `t4g.small` by default) in its own VPC, with an encrypted disk
+- an `agent` user with tmux, git, Claude Code, hearth and embers installed and the embers hook turned on, plus the Codex CLI if you set `InstallCodex=true`
+- access through SSM Session Manager, with an SSH port only if you give it an address range
+- a GitHub SSH key, either from Secrets Manager or generated on first boot and printed in the setup log
+- optionally: a Route 53 DNS name, a CloudWatch dashboard for CPU, memory, disk and network, and daily disk snapshots kept for a week
+
+The instance role can use Session Manager and send metrics, and nothing else. If your agents need to work with AWS, attach a policy you've scoped to what they do.
+
+### Deploy
+
+```bash
+aws cloudformation create-stack --stack-name agents \
+  --template-body file://cloud/agent-server.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters ParameterKey=SSHCidr,ParameterValue=203.0.113.7/32 \
+               ParameterKey=KeyName,ParameterValue=my-key
+aws cloudformation wait stack-create-complete --stack-name agents
+aws cloudformation describe-stacks --stack-name agents --query 'Stacks[0].Outputs'
+```
+
+Leave out `SSHCidr` and `KeyName` to connect only with `aws ssm start-session` (this needs the Session Manager plugin for the AWS CLI). Setup takes about five minutes, and the stack fails right away if it goes wrong. Its log is at `/var/log/hearth-setup.log`.
+
+Once you're on the server as the agent user, sign in to Claude Code once by running `claude`, then add projects with `hearth add` as usual. Sessions keep running when you disconnect.
+
+### Keeping it current
+
+The first deploy installs the newest version of everything: the latest Amazon Linux 2023 image and packages, Claude Code, Codex, and hearth from `main`. After that:
+
+- **Claude Code** updates itself.
+- **The OS** gets updates weekly from a systemd timer (`hearth-update.timer`; turn it off with `AutoUpdate=false`). It never reboots, because that would end the agents' sessions, so reboot yourself after a kernel update.
+- **hearth and embers** are linked from `~/hearth`, so `git -C ~/hearth pull` upgrades both.
+- **Codex** doesn't update itself. Re-run its install step from the template to upgrade it.
+
+**Pin the image after the first deploy.** CloudFormation looks up the latest image again on every stack update, so a later update would replace the server once AWS publishes a newer one. Run the command in the `FindImageId` output and pass the result as `ImageId` on every update after that. If a replacement happens anyway, the template keeps the old server and its disk instead of deleting them, so nothing is lost. Delete the old one yourself once you've moved over.
+
+### What it costs
+
+These are rough on-demand prices in a US region for a server that runs all month. Check current AWS pricing for yours.
+
+| | per month |
+| --- | --- |
+| `t4g.small` instance (2 vCPU, 2 GB) | about $12 |
+| 20 GB disk | about $1.60 |
+| public IPv4 address | about $3.60 |
+| snapshots, dashboard and memory/disk metrics | about $1 to $4 |
+| **total** | **about $18 to $22** |
+
+At that rate a small server costs about as much as a new desktop Mac mini after two to three years, and needs no hardware, power or home network. Each Claude Code session uses a few hundred MB of memory, so for more than three or four agents at once, use `t4g.medium` (4 GB, about $25 a month for the instance). Stopping the instance stops the instance charge, but the public IP changes on the next start. Model usage is billed separately by your Claude plan or API key either way.
 
 ## License
 
