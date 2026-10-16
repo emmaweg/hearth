@@ -290,6 +290,16 @@ def cmd_menu(args):
 
 ADD, SHELL = "+ Add a project", "○ Back to the shell"
 
+LETTERS = [
+    "   __                __  __ ",
+    "  / /  ___ ___ _____/ /_/ / ",
+    " / _ \\/ -_) _ `/ __/ __/ _ \\",
+    "/_//_/\\__/\\_,_/_/  \\__/_//_/",
+]
+BANNER = (["╭" + "─" * (len(LETTERS[0]) + 2) + "╮"]
+          + ["│ " + line + " │" for line in LETTERS]
+          + ["╰" + "─" * (len(LETTERS[0]) + 2) + "╯"])
+
 
 def menu():
     """Show the menu. Returns (project, agent), "add", or None to quit."""
@@ -319,7 +329,7 @@ def menu():
         curses.use_default_colors()
         rich = curses.COLORS >= 256
         pairs = {  # 256-colour, 8-colour fallback
-            1: ((141, -1), (curses.COLOR_MAGENTA, -1)),             # title
+            1: ((221, -1), (curses.COLOR_YELLOW, -1)),              # title
             2: ((253, -1), (curses.COLOR_WHITE, -1)),               # item
             3: ((253, 239), (curses.COLOR_WHITE, curses.COLOR_BLUE)),  # selected
             4: ((84, -1), (curses.COLOR_GREEN, -1)),                # running
@@ -327,6 +337,12 @@ def menu():
             6: ((61, -1), (curses.COLOR_WHITE, -1)),                # rule
             7: ((117, -1), (curses.COLOR_CYAN, -1)),                # footer
             8: ((215, -1), (curses.COLOR_YELLOW, -1)),              # category
+            9: ((137, -1), (curses.COLOR_YELLOW, -1)),              # banner frame
+            # banner letters, amber at the top cooling to coral like embers
+            10: ((221, -1), (curses.COLOR_YELLOW, -1)),
+            11: ((215, -1), (curses.COLOR_YELLOW, -1)),
+            12: ((209, -1), (curses.COLOR_RED, -1)),
+            13: ((203, -1), (curses.COLOR_RED, -1)),
         }
         for n, (full, basic) in pairs.items():
             curses.init_pair(n, *(full if rich else basic))
@@ -342,10 +358,26 @@ def menu():
     def draw(scr, cursor, top):
         scr.erase()
         h, w = scr.getmaxyx()
-        put(scr, 1, 3, "hearth", curses.color_pair(1) | curses.A_BOLD)
-        put(scr, 1, 10, "· %d running" % sum(1 for p in projects if status(p, running)),
-            curses.color_pair(6))
-        first, height = 3, max(1, h - 6)
+        title = curses.color_pair(1) | curses.A_BOLD
+        count = "%d running" % sum(1 for p in projects if status(p, running))
+        # The banner when the whole menu still fits under it, a one-line title otherwise.
+        if w >= len(BANNER[0]) + 4 and h >= len(BANNER) + len(rows) + 8:
+            left = (w - len(BANNER[0])) // 2
+            frame = curses.color_pair(9)
+            for y, line in enumerate(BANNER, start=1):
+                if y in (1, len(BANNER)):
+                    put(scr, y, left, line, frame)
+                else:
+                    put(scr, y, left, line[:2], frame)
+                    put(scr, y, left + 2, line[2:-2], curses.color_pair(9 + y - 1) | curses.A_BOLD)
+                    put(scr, y, left + len(line) - 2, line[-2:], frame)
+            put(scr, len(BANNER) + 1, (w - len(count)) // 2, count, curses.color_pair(9))
+            first = len(BANNER) + 3
+        else:
+            put(scr, 1, 3, "hearth", title)
+            put(scr, 1, 10, "· " + count, curses.color_pair(6))
+            first = 3
+        height = max(1, h - first - 3)
         current = selectable[cursor]
         if current < top:
             top = current
