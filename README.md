@@ -146,6 +146,17 @@ Leave out `SSHCidr` and `KeyName` to connect only with `aws ssm start-session` (
 
 Once you're on the server as the agent user, sign in to Claude Code once by running `claude`, then add projects with `hearth add` as usual. Sessions keep running when you disconnect.
 
+### Keeping it current
+
+The first deploy installs the newest version of everything: the latest Amazon Linux 2023 image and packages, Claude Code, Codex, and hearth from `main`. After that:
+
+- **Claude Code** updates itself.
+- **The OS** gets updates weekly from a systemd timer (`hearth-update.timer`; turn it off with `AutoUpdate=false`). It never reboots, because that would end the agents' sessions, so reboot yourself after a kernel update.
+- **hearth and embers** are linked from `~/hearth`, so `git -C ~/hearth pull` upgrades both.
+- **Codex** doesn't update itself. Re-run its install step from the template to upgrade it.
+
+**Pin the image after the first deploy.** CloudFormation looks up the latest image again on every stack update, so a later update would replace the server once AWS publishes a newer one. Run the command in the `FindImageId` output and pass the result as `ImageId` on every update after that. If a replacement happens anyway, the template keeps the old server and its disk instead of deleting them, so nothing is lost. Delete the old one yourself once you've moved over.
+
 ### What it costs
 
 These are rough on-demand prices in a US region for a server that runs all month. Check current AWS pricing for yours.

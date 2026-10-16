@@ -15,6 +15,13 @@ Parameters:
     Default: arm64
     AllowedValues: [arm64, x86_64]
 
+  ImageId:
+    Description: >-
+      AMI to run. Leave empty on the first deploy to get the latest Amazon Linux 2023, then set it
+      to the image the FindImageId output prints, so later stack updates don't replace the server with a newer image.
+    Type: String
+    Default: ''
+
   VolumeSizeGB:
     Description: Size of the root volume in GB
     Type: Number
@@ -75,6 +82,12 @@ Parameters:
     Type: String
     Default: main
 
+  AutoUpdate:
+    Description: Apply OS updates weekly, moving to the newest Amazon Linux 2023 release. It never reboots.
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
   InstallCodex:
     Description: Also install the OpenAI Codex CLI, for hearth's Codex sessions
     Type: String
@@ -95,6 +108,7 @@ Parameters:
 
 Conditions:
   IsArm64: !Equals [!Ref Architecture, arm64]
+  HasImageId: !Not [!Equals [!Ref ImageId, '']]
   HasKey: !Not [!Equals [!Ref KeyName, '']]
   HasSSH: !Not [!Equals [!Ref SSHCidr, '']]
   HasDNS: !And
@@ -224,16 +238,24 @@ Resources:
   # ── The server ────────────────────────────────────────────────────
   Instance:
     Type: AWS::EC2::Instance
+    # If an update ever does replace the server, keep the old one (and its
+    # disk) instead of deleting it. Delete it yourself once you've moved off.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete  # deleting the stack still deletes the server
     CreationPolicy:
       ResourceSignal:
         Count: 1
         Timeout: PT30M
     Properties:
       InstanceType: !Ref InstanceType
+      # The latest-image lookup runs again on every stack update, so pin ImageId after the first deploy.
       ImageId: !If
-        - IsArm64
-        - '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
-        - '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        - HasImageId
+        - !Ref ImageId
+        - !If
+          - IsArm64
+          - '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+          - '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       KeyName: !If [HasKey, !Ref KeyName, !Ref AWS::NoValue]
       SubnetId: !Ref PublicSubnet
       SecurityGroupIds:
@@ -313,8 +335,9 @@ Resources:
           fi
 
           git clone --branch "$HEARTH_REF" "$HEARTH_REPO" hearth
-          [ -f hearth/bin/hearth ] && install -m 755 hearth/bin/hearth .local/bin/hearth
-          install -m 755 hearth/hooks/embers.sh .claude/hooks/embers.sh
+          # Links, not copies, so `git -C ~/hearth pull` is the whole upgrade.
+          [ -f hearth/bin/hearth ] && ln -sf "$HOME/hearth/bin/hearth" .local/bin/hearth
+          ln -sf "$HOME/hearth/hooks/embers.sh" .claude/hooks/embers.sh
           # The embers Stop hook, merged into any user settings already there.
           [ -f .claude/settings.json ] || echo '{}' > .claude/settings.json
           jq '.hooks.Stop = ((.hooks.Stop // []) + [{"hooks":[{"type":"command","command":"$HOME/.claude/hooks/embers.sh"}]}])' \
@@ -337,6 +360,31 @@ Resources:
             Then add projects with: hearth add <name> <dir>   and open the menu with: hearth
 
           MOTD
+
+          # Weekly OS updates. Amazon Linux 2023 stays on the release it booted
+          # with unless asked, so this moves it to the latest one. No reboot: that
+          # would end the agents' sessions. Reboot yourself after kernel updates.
+          if [ "${AutoUpdate}" = true ]; then
+            cat > /etc/systemd/system/hearth-update.service <<'UNIT'
+          [Unit]
+          Description=Apply Amazon Linux updates (hearth)
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/dnf upgrade -y --releasever=latest
+          UNIT
+            cat > /etc/systemd/system/hearth-update.timer <<'UNIT'
+          [Unit]
+          Description=Weekly Amazon Linux updates (hearth)
+          [Timer]
+          OnCalendar=Sun 04:00
+          RandomizedDelaySec=1h
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          UNIT
+            systemctl daemon-reload
+            systemctl enable --now hearth-update.timer
+          fi
 
           if [ "${EnableMonitoring}" = true ]; then
             dnf install -y amazon-cloudwatch-agent
@@ -445,6 +493,10 @@ Outputs:
     Value: !Sub
       - ssh ${AgentUser}@${Host}
       - Host: !If [HasDNS, !Ref RecordName, !GetAtt Instance.PublicIp]
+
+  FindImageId:
+    Description: Prints the AMI the server runs. Pass it as the ImageId parameter on later updates.
+    Value: !Sub aws ec2 describe-instances --region ${AWS::Region} --instance-ids ${Instance} --query 'Reservations[0].Instances[0].ImageId' --output text
 
   SessionManagerCommand:
     Description: Connect without SSH, then run sudo -iu as the agent user
