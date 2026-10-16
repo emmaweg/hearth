@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""hearth: start, attach and list the tmux sessions of a Claude Code fleet.
+
+Each project in the registry gets its own tmux session running an agent in
+that project's directory. Starting a project that is already running attaches
+to it instead, so `hearth start <name>` is safe to run any time.
+
+  hearth                      open the menu
+  hearth start <name> [agent] start or attach a project's session
+  hearth list                 show projects and which are running
+  hearth add <name> <dir> [category]
+                              add a project to the registry
+  hearth kill <name> [agent]  end a project's session
+
+agent is claude or codex. A codex session is named "<name>-codex", so both
+agents can work on one project side by side.
+
+Registry: one project per line, fields separated by colons.
+
+  name:directory:prompt:category:agent:options
+
+Only name and directory are required. prompt is sent when a session starts.
+category groups the menu. agent pins an entry to claude or codex; left empty,
+the entry follows the menu's toggle. options, for claude only, is a comma
+list: agent=<name> loads .claude/agents/<name>.md, and session=<uuid> pins
+the conversation the session resumes. An entry with agent= but no session=
+gets a stable id derived from its name, so several roles can share one
+directory without resuming each other's conversations.
+
+Settings (environment):
+  HEARTH_PROJECTS    registry file (default ~/.config/hearth/projects.conf)
+  HEARTH_AGENT       agent the menu starts with (default claude)
+  HEARTH_CLAUDE_ARGS extra arguments for every claude session
+  HEARTH_CODEX_ARGS  extra arguments for every codex session
+
+MIT License. See LICENSE.
+"""
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+import uuid
+
+AGENTS = ("claude", "codex")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def registry_path():
+    path = os.environ.get("HEARTH_PROJECTS")
+    if not path:
+        config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        path = os.path.join(config, "hearth", "projects.conf")
+    return os.path.expanduser(path)
+
+
+class Project:
+    def __init__(self, fields):
+        fields = fields + [""] * (6 - len(fields))
+        self.name, self.dir, self.prompt, self.category = fields[:4]
+        self.dir = os.path.expanduser(self.dir)
+        self.agent = fields[4] if fields[4] in AGENTS else ""
+        self.options = {}
+        for kv in fields[5].split(","):
+            if "=" in kv:
+                key, value = kv.split("=", 1)
+                self.options[key.strip()] = value.strip()
+
+
+def load_projects():
+    projects = []
+    try:
+        with open(registry_path()) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # The options field is last, so it may hold anything but a newline.
+                project = Project(line.split(":", 5))
+                if project.name and project.dir:
+                    projects.append(project)
+    except FileNotFoundError:
+        pass
+    return projects
+
+
+def find_project(name):
+    for project in load_projects():
+        if project.name == name:
+            return project
+    return None
+
+
+# ── tmux ───────────────────────────────────────────────────────────
+
+def session_name(name, agent):
+    # A project already named "<x>-codex" keeps its name, so an entry pinned
+    # to codex and `hearth start <x> codex` share one session.
+    if agent == "codex" and not name.endswith("-codex"):
+        return name + "-codex"
+    return name
+
+
+def running_sessions():
+    try:
+        out = subprocess.run(["tmux", "list-sessions", "-F", "#S"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(out.stdout.split()) if out.returncode == 0 else set()
+
+
+def has_session(session):
+    return subprocess.run(["tmux", "has-session", "-t", "=" + session],
+                          capture_output=True).returncode == 0
+
+
+def status(project, running):
+    """Which of the project's agents are running: "claude", "codex", "claude+codex" or ""."""
+    agents = [project.agent] if project.agent else AGENTS
+    up = [a for a in agents if session_name(project.name, a) in running]
+    return "+".join(up)
+
+
+def agent_command(project, agent):
+    """The shell command a new session runs: resume the agent's last
+    conversation here, or start a fresh one, then leave a login shell."""
+    def cmd(*parts):
+        return " ".join(shlex.quote(p) for p in parts if p)
+
+    prompt = project.prompt
+    if agent == "codex":
+        extra = shlex.split(os.environ.get("HEARTH_CODEX_ARGS", ""))
+        resume = cmd("codex", "resume", "--last", *extra, prompt)
+        start = cmd("codex", *extra, prompt)
+    else:
+        extra = shlex.split(os.environ.get("HEARTH_CLAUDE_ARGS", ""))
+        role = project.options.get("agent", "")
+        sid = project.options.get("session", "")
+        if role and not sid:
+            sid = str(uuid.uuid5(uuid.NAMESPACE_URL, "hearth/" + project.name))
+        role_args = ["--agent", role] if role else []
+        if sid:
+            resume = cmd("claude", "--resume", sid, *role_args, *extra, prompt)
+            start = cmd("claude", "--session-id", sid, "--name", project.name,
+                        *role_args, *extra, prompt)
+        else:
+            resume = cmd("claude", "--continue", *extra, prompt)
+            start = cmd("claude", *extra, prompt)
+    shell = shlex.quote(os.environ.get("SHELL") or "/bin/sh")
+    return "(%s || %s); exec %s -l" % (resume, start, shell)
+
+
+def open_session(project, agent):
+    """Attach to the project's session, starting it first if needed."""
+    if not os.path.isdir(project.dir):
+        sys.exit("hearth: directory not found: %s" % project.dir)
+    session = session_name(project.name, agent)
+    inside = bool(os.environ.get("TMUX"))
+    if not has_session(session):
+        new = ["tmux", "new-session", "-s", session, "-c", project.dir,
+               agent_command(project, agent)]
+        if inside:
+            subprocess.run(new[:2] + ["-d"] + new[2:], check=True)
+        else:
+            os.execvp("tmux", new)
+    if inside:
+        os.execvp("tmux", ["tmux", "switch-client", "-t", "=" + session])
+    os.execvp("tmux", ["tmux", "attach-session", "-t", "=" + session])
+
+
+# ── commands ───────────────────────────────────────────────────────
+
+def cmd_start(args):
+    if not args or len(args) > 2:
+        sys.exit("usage: hearth start <name> [claude|codex]")
+    project = find_project(args[0])
+    if not project:
+        sys.exit("hearth: no project '%s' (see hearth list)" % args[0])
+    # An agent given here wins over the entry's pinned one.
+    agent = args[1] if len(args) > 1 else project.agent or "claude"
+    if agent not in AGENTS:
+        sys.exit("hearth: unknown agent '%s' (claude or codex)" % agent)
+    open_session(project, agent)
+
+
+def grouped(projects):
+    """Projects grouped by category, in the order categories first appear."""
+    groups = {}
+    for project in projects:
+        groups.setdefault(project.category, []).append(project)
+    return list(groups.items())
+
+
+def category_label(category):
+    return category or "Uncategorized"
+
+
+def cmd_list(args):
+    projects = load_projects()
+    if not projects:
+        print("No projects in %s yet. Add one with: hearth add <name> <dir>" % registry_path())
+        return
+    running = running_sessions()
+    width = max(len(p.name) for p in projects)
+    home = os.path.expanduser("~")
+
+    def short(path):
+        return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+    for i, (category, members) in enumerate(grouped(projects)):
+        print(("\n" if i else "") + category_label(category))
+        for p in members:
+            up = status(p, running)
+            mark = ("● " + up) if up else "○"
+            print("  %-*s  %-14s %s" % (width, p.name, mark, short(p.dir)))
+
+
+def add_project(name, directory, category=""):
+    if not NAME_RE.match(name):
+        sys.exit("hearth: a name may use only letters, digits, - and _")
+    directory = os.path.abspath(os.path.expanduser(directory))
+    if not os.path.isdir(directory):
+        sys.exit("hearth: directory not found: %s" % directory)
+    if ":" in directory or ":" in category:
+        sys.exit("hearth: the registry is colon-separated, so a directory or category can't contain ':'")
+    if find_project(name):
+        sys.exit("hearth: '%s' is already in the registry" % name)
+    path = registry_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    needs_newline = False
+    if os.path.exists(path) and os.path.getsize(path):
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            needs_newline = f.read(1) != b"\n"
+    with open(path, "a") as f:
+        f.write(("\n" if needs_newline else "") + "%s:%s::%s\n" % (name, directory, category))
+    print("Added %s → %s" % (name, directory))
+    return find_project(name)
+
+
+def cmd_add(args):
+    if len(args) not in (2, 3):
+        sys.exit("usage: hearth add <name> <dir> [category]")
+    add_project(*args)
+
+
+def cmd_kill(args):
+    if not args or len(args) > 2:
+        sys.exit("usage: hearth kill <name> [claude|codex]")
+    name = args[0]
+    project = find_project(name)
+    if len(args) > 1:
+        sessions = [session_name(name, args[1])]
+    elif project:
+        sessions = [session_name(name, a) for a in ([project.agent] if project.agent else AGENTS)]
+    else:
+        sessions = [name]  # not in the registry: treat it as a session name
+    killed = [s for s in sessions if has_session(s) and
+              subprocess.run(["tmux", "kill-session", "-t", "=" + s]).returncode == 0]
+    for s in killed:
+        print("Ended session %s" % s)
+    if not killed:
+        print("No running session for %s" % name)
+
+
+def cmd_menu(args):
+    choice = menu()
+    if choice is None:
+        return
+    if choice == "add":
+        try:
+            name = input("Project name: ").strip()
+            directory = input("Directory: ").strip()
+            category = input("Category (optional): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not name or not directory:
+            print("Cancelled.")
+            return
+        open_session(add_project(name, directory, category), os.environ.get("HEARTH_AGENT", "claude"))
+        return
+    project, agent = choice
+    open_session(project, agent)
+
+
+# ── menu ───────────────────────────────────────────────────────────
+
+ADD, SHELL = "+ Add a project", "○ Back to the shell"
+
+LETTERS = [
+    "█                             ▄    █    ",
+    "█ ▄▄    ▄▄▄    ▄▄▄    ▄ ▄▄  ▄▄█▄▄  █ ▄▄ ",
+    "█▀  █  █▀  █  ▀   █   █▀  ▀   █    █▀  █",
+    "█   █  █▀▀▀▀  ▄▀▀▀█   █       █    █   █",
+    "█   █  ▀█▄▄▀  ▀▄▄▀█   █       ▀▄▄  █   █",
+]
+BANNER = (["╭" + "─" * (len(LETTERS[0]) + 2) + "╮"]
+          + ["│ " + line + " │" for line in LETTERS]
+          + ["╰" + "─" * (len(LETTERS[0]) + 2) + "╯"])
+
+
+def menu():
+    """Show the menu. Returns (project, agent), "add", or None to quit."""
+    import curses
+    os.environ.setdefault("ESCDELAY", "25")
+    agent = os.environ.get("HEARTH_AGENT", "claude")
+    if agent not in AGENTS:
+        agent = "claude"
+    projects = load_projects()
+    running = running_sessions()
+
+    rows = []  # ("category", label) | ("project", Project) | ("action", label) | ("rule",)
+    for category, members in grouped(projects):
+        rows.append(("category", category_label(category)))
+        rows.extend(("project", p) for p in members)
+    rows += [("rule",), ("action", ADD), ("action", SHELL)]
+    selectable = [i for i, r in enumerate(rows) if r[0] in ("project", "action")]
+    name_width = max([len(p.name) for p in projects] or [0])  # lines up the ● column
+
+    def pick(row, agent):
+        if row[0] == "project":
+            return (row[1], row[1].agent or agent)  # a pinned entry ignores the toggle
+        return "add" if row[1] == ADD else None
+
+    def colors():
+        curses.start_color()
+        curses.use_default_colors()
+        rich = curses.COLORS >= 256
+        pairs = {  # 256-colour, 8-colour fallback
+            1: ((221, -1), (curses.COLOR_YELLOW, -1)),              # title
+            2: ((253, -1), (curses.COLOR_WHITE, -1)),               # item
+            3: ((253, 239), (curses.COLOR_WHITE, curses.COLOR_BLUE)),  # selected
+            4: ((84, -1), (curses.COLOR_GREEN, -1)),                # running
+            5: ((84, 239), (curses.COLOR_GREEN, curses.COLOR_BLUE)),   # running, selected
+            6: ((61, -1), (curses.COLOR_WHITE, -1)),                # rule
+            7: ((117, -1), (curses.COLOR_CYAN, -1)),                # footer
+            8: ((215, -1), (curses.COLOR_YELLOW, -1)),              # category
+            9: ((137, -1), (curses.COLOR_YELLOW, -1)),              # banner frame
+        }
+        # Banner letters, one colour per row: amber at the top, cooling to coral like embers.
+        y, r = curses.COLOR_YELLOW, curses.COLOR_RED
+        for n, (full, basic) in enumerate([(222, y), (221, y), (215, y), (209, r), (203, r)], start=10):
+            pairs[n] = ((full, -1), (basic, -1))
+        for n, (full, basic) in pairs.items():
+            curses.init_pair(n, *(full if rich else basic))
+
+    def put(scr, y, x, text, attr=0):
+        h, w = scr.getmaxyx()
+        if 0 <= y < h and x < w - 1:
+            try:
+                scr.addnstr(y, x, text, w - 1 - x, attr)
+            except curses.error:
+                pass
+
+    def draw(scr, cursor, top):
+        scr.erase()
+        h, w = scr.getmaxyx()
+        title = curses.color_pair(1) | curses.A_BOLD
+        count = "%d running" % sum(1 for p in projects if status(p, running))
+        # The banner when the whole menu still fits under it, a one-line title otherwise.
+        if w >= len(BANNER[0]) + 4 and h >= len(BANNER) + len(rows) + 8:
+            left = (w - len(BANNER[0])) // 2
+            frame = curses.color_pair(9)
+            for y, line in enumerate(BANNER, start=1):
+                if y in (1, len(BANNER)):
+                    put(scr, y, left, line, frame)
+                else:
+                    put(scr, y, left, line[:2], frame)
+                    put(scr, y, left + 2, line[2:-2], curses.color_pair(9 + y - 1) | curses.A_BOLD)
+                    put(scr, y, left + len(line) - 2, line[-2:], frame)
+            put(scr, len(BANNER) + 1, (w - len(count)) // 2, count, curses.color_pair(9))
+            first = len(BANNER) + 3
+        else:
+            put(scr, 1, 3, "hearth", title)
+            put(scr, 1, 10, "· " + count, curses.color_pair(6))
+            first = 3
+        height = max(1, h - first - 3)
+        current = selectable[cursor]
+        if current < top:
+            top = current
+        elif current >= top + height:
+            top = current - height + 1
+        if not projects:
+            put(scr, first, 3, "No projects yet. Add one below.", curses.color_pair(6))
+            first += 2
+        for y, i in enumerate(range(top, min(len(rows), top + height)), start=first):
+            row = rows[i]
+            if row[0] == "category":
+                put(scr, y, 3, row[1], curses.color_pair(8) | curses.A_BOLD)
+                continue
+            if row[0] == "rule":
+                put(scr, y, 3, "─" * min(w - 6, 30), curses.color_pair(6))
+                continue
+            selected = i == current
+            n = selectable.index(i)
+            key = str((n + 1) % 10) if n < 10 else " "
+            prefix = "  ▸ " if selected else "  %s " % key
+            label = row[1].name if row[0] == "project" else row[1]
+            put(scr, y, 0, (prefix + label).ljust(w - 1),
+                curses.color_pair(3 if selected else 2) | (curses.A_BOLD if selected else 0))
+            up = status(row[1], running) if row[0] == "project" else ""
+            if up:
+                put(scr, y, len(prefix) + name_width + 1, " ● " + up,
+                    curses.color_pair(5 if selected else 4) | (curses.A_BOLD if selected else 0))
+        put(scr, h - 2, 2, "agent: %s (a toggles)   ↑↓ or j k move   1-9, 0 jump   enter open   q quit"
+            % agent, curses.color_pair(7))
+        scr.refresh()
+        return top
+
+    def run(scr):
+        nonlocal agent
+        curses.curs_set(0)
+        scr.keypad(True)
+        colors()
+        cursor = top = 0
+        while True:
+            top = draw(scr, cursor, top)
+            key = scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                cursor = (cursor - 1) % len(selectable)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cursor = (cursor + 1) % len(selectable)
+            elif key in (ord("q"), 27):
+                return None
+            elif key in (ord("a"), ord("A")):
+                agent = "codex" if agent == "claude" else "claude"
+            elif ord("0") <= key <= ord("9"):
+                n = (key - ord("0") - 1) % 10  # 1-9 pick the first nine, 0 the tenth
+                if n < len(selectable):
+                    return pick(rows[selectable[n]], agent)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                return pick(rows[selectable[cursor]], agent)
+
+    return curses.wrapper(run)
+
+
+COMMANDS = {"start": cmd_start, "list": cmd_list, "add": cmd_add,
+            "kill": cmd_kill, "menu": cmd_menu}
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    command = COMMANDS.get(args[0] if args else "menu")
+    if not command:
+        sys.exit("hearth: unknown command '%s' (see hearth --help)" % args[0])
+    command(args[1:])
+
+
+if __name__ == "__main__":
+    main()
